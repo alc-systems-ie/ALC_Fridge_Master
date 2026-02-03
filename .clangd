@@ -1,0 +1,7 @@
+Diagnostics:
+  Suppress: -Wvla-cxx-extension
+
+CompileFlags:
+  Add: [-std=c++20]
+  Remove: [-mfp16-format=ieee, -fno-reorder-functions, -Wno-vla]
+  # Remove: [-fno-tree-switch-conversion, -fno-shrink-wrap, -mtext-section-literals, -mlongcalls, -fstrict-volatile-bitfields, -fno-reorder-functions]

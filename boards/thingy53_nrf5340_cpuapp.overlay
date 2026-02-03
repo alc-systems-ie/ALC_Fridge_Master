@@ -1,0 +1,5 @@
+/* Override ADXL362 INT1 to ensure active-high for wake. */
+&adxl362 {
+	status = "okay";
+	int1-gpios = <&gpio0 19 GPIO_ACTIVE_HIGH>;
+};

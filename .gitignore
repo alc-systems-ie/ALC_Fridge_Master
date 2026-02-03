@@ -1,0 +1,6 @@
+.DS_Store
+build/
+compile_commands.json
+.cache/
+.git/
+*.rst
