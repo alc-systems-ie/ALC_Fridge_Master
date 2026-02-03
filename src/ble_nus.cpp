@@ -9,7 +9,7 @@
 
 LOG_MODULE_REGISTER(ble_nus, LOG_LEVEL_INF);
 
-namespace drawer 
+namespace fridge 
 {
 
  // ========== Static State ==========

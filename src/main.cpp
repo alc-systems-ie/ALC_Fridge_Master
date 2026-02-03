@@ -1,87 +1,73 @@
 /*
- * Drawer Activity Sensor for Thingy:53 (nRF5340)
+ * Fridge Light Monitor
  *
- * Wakes from System OFF on ADXL362 motion detection, reads BH1749 light sensor,
- * transmits data over BLE NUS to gateway, then returns to System OFF.
+ * Monitors fridge door open/close events using BH1749 light sensor.
+ * - Thingy:53: INT pin on P1.05
+ * - Thingy:91: INT pin on P0.27
  */
 
 #include <zephyr/kernel.h>
-#include <zephyr/sys/poweroff.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/gpio.h>
-#include <zephyr/drivers/spi.h>
 #include <zephyr/drivers/i2c.h>
 #include <zephyr/logging/log.h>
 #include <helpers/nrfx_reset_reason.h>
 
-#include <string.h>
+// #include <string.h>
 
-#include "adxl362.hpp"
 #include "bh1749_light.hpp"
+
+#if defined(CONFIG_BT)
 #include "ble_nus.hpp"
+#endif
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
 // ========== Hardware Definitions ==========
 
-// ADXL362 INT1 pin (P0.19 on Thingy:53).
-static const struct gpio_dt_spec s_wakePin =
-    GPIO_DT_SPEC_GET(DT_NODELABEL(adxl362), int1_gpios);
-
-// ADXL362 SPI bus from devicetree.
-static const struct spi_dt_spec s_accelSpi =
-    SPI_DT_SPEC_GET(DT_NODELABEL(adxl362), SPI_WORD_SET(8) | SPI_TRANSFER_MSB, 0);
-
 // BH1749 I2C bus from devicetree.
-static const struct i2c_dt_spec s_lightI2c =
-    I2C_DT_SPEC_GET(DT_NODELABEL(bh1749));
+static const struct i2c_dt_spec s_lightI2c = I2C_DT_SPEC_GET(DT_NODELABEL(bh1749));
 
-// Status LED (red).
-static const struct gpio_dt_spec s_led =
-    GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
+// BH1749 INT pin from devicetree.
+static const struct gpio_dt_spec s_lightInt = GPIO_DT_SPEC_GET(DT_NODELABEL(bh1749), int_gpios);
+
+// Status LED (red). 
+static const struct gpio_dt_spec s_led = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
 
 // ========== Constants ==========
 
-// 10 minutes at 100 Hz = 60,000 samples.
-constexpr uint16_t M_INACTIVITY_TIME_SAMPLES { 60000 };
+// Light thresholds for door detection.
+constexpr uint16_t M_LIGHT_THRESHOLD_OPEN  { 200 };  // Door open when light exceeds this.
+constexpr uint16_t M_LIGHT_THRESHOLD_CLOSE { 50 };   // Door closed when light drops below this.
 
+// Polling intervals.
+constexpr uint32_t M_POLL_INTERVAL_IDLE_MS { 1000 };  // Polling when door is closed.
+constexpr uint32_t M_POLL_INTERVAL_OPEN_MS { 500 };   // Polling when door is open.
+
+// Door open timeout before alert (default 60 seconds).
+constexpr uint16_t M_DOOR_OPEN_TIMEOUT_SECS { 60 };
+
+#if defined(CONFIG_BT)
 // BLE timeouts.
 constexpr uint32_t M_BLE_CONNECT_TIMEOUT_MS { 10000 };
 constexpr uint32_t M_BLE_NUS_ENABLED_TIMEOUT_MS { 5000 };
+#endif
 
 // Device ID for this sensor node.
 constexpr uint8_t M_DEVICE_ID { 1 };
 
-// Dummy config to force AWAKE=0 during init.
-static constexpr drawer::Adxl362::ActivityConfig M_DUMMY_CONFIG {
-  .activityMode         = drawer::Adxl362::ActivityMode::Absolute,
-  .inactivityMode       = drawer::Adxl362::ActivityMode::Absolute,
-  .linkLoop             = drawer::Adxl362::LinkLoopMode::Loop,
-  .activityThresholdMg  = 1,
-  .activityTime         = 0,
-  .inactivityThresholdMg = 2000,
-  .inactivityTime       = 1
-};
-
-// Real config for motion detection.
-static constexpr drawer::Adxl362::ActivityConfig M_MOTION_CONFIG {
-  .activityMode         = drawer::Adxl362::ActivityMode::Referenced,
-  .inactivityMode       = drawer::Adxl362::ActivityMode::Referenced,
-  .linkLoop             = drawer::Adxl362::LinkLoopMode::Loop,
-  .activityThresholdMg  = 120,
-  .activityTime         = 2,
-  .inactivityThresholdMg = 150,
-  .inactivityTime       = M_INACTIVITY_TIME_SAMPLES
-};
-
 // ========== Static State ==========
 
-static drawer::Adxl362 s_accel { &s_accelSpi };
-static drawer::Bh1749Light s_light { &s_lightI2c };
-static drawer::BleNus s_ble;
+static fridge::Bh1749Light s_light { &s_lightI2c };
 
-// Stored light reading for BLE transmission.
-static drawer::LightReading s_lightReading {};
+#if defined(CONFIG_BT)
+static fridge::BleNus s_ble;
+static bool s_bleInitialised { false };
+#endif
+
+// Door state tracking.
+enum class DoorState { Closed, Open };
+static DoorState s_doorState { DoorState::Closed };
 
 // ========== Helper Functions ==========
 
@@ -108,135 +94,52 @@ static void logResetReason(uint32_t reason)
   }
 }
 
-static void configureWakePin(bool senseHigh)
-{
-  if (!gpio_is_ready_dt(&s_wakePin)) {
-    LOG_ERR("Wake pin device not ready!");
-    return;
-  }
-
-  // Configure as input.
-  int ret { gpio_pin_configure_dt(&s_wakePin, GPIO_INPUT) };
-  if (ret < 0) {
-    LOG_ERR("Failed to configure wake pin: %d!", ret);
-    return;
-  }
-
-  // Configure sense based on current pin state.
-  // If senseHigh=true: wake when pin goes HIGH (normal activity detection).
-  // If senseHigh=false: wake when pin goes LOW (after inactivity clears AWAKE).
-  gpio_flags_t flags { senseHigh ? GPIO_INT_LEVEL_HIGH : GPIO_INT_LEVEL_LOW };
-  ret = gpio_pin_interrupt_configure_dt(&s_wakePin, flags);
-  if (ret < 0) {
-    LOG_ERR("Failed to configure wake interrupt: %d!", ret);
-    return;
-  }
-
-  uint8_t port { static_cast<uint8_t>(s_wakePin.port == DEVICE_DT_GET(DT_NODELABEL(gpio0)) ? 0 : 1) };
-  LOG_INF("Wake pin configured (P%u.%02u, sense %s).", port, s_wakePin.pin, senseHigh ? "HIGH" : "LOW");
-}
-
-static void enterSystemOff()
-{
-  LOG_INF("Preparing for System OFF...");
-
-  // Check current INT1 level.
-  int pinLevel { gpio_pin_get_dt(&s_wakePin) };
-  LOG_INF("INT1 level: %d.", pinLevel);
-
-  // Configure sense based on current pin state:
-  // - If INT1 is HIGH (AWAKE=1): sense LOW to wake when inactivity clears AWAKE.
-  // - If INT1 is LOW (AWAKE=0): sense HIGH to wake on next activity.
-  // This allows immediate sleep without waiting for the inactivity timeout.
-  bool senseHigh { pinLevel == 0 };
-
-  LOG_INF("Entering System OFF (will wake on %s edge)...", senseHigh ? "rising" : "falling");
-
-  // Give the logger time to flush.
-  k_msleep(100);
-
-  configureWakePin(senseHigh);
-
-  // sys_poweroff() does not return — the chip resets on wake.
-  sys_poweroff();
-
-  LOG_ERR("sys_poweroff() returned!");
-}
-
-static void configureAdxl362()
-{
-  LOG_INF("Configuring ADXL362...");
-
-  int result { s_accel.Init() };
-  if (result < 0) {
-    LOG_ERR("ADXL362 init failed: %d!", result);
-    return;
-  }
-
-  result = s_accel.SetRange(drawer::Adxl362::Range::Range2g);
-  if (result < 0) { return; }
-
-  result = s_accel.SetOdr(drawer::Adxl362::ODR::Odr100);
-  if (result < 0) { return; }
-
-  // Step 1: Configure with dummy thresholds to force AWAKE=0.
-  result = s_accel.ConfigureActivity(M_DUMMY_CONFIG);
-  if (result < 0) { return; }
-
-  result = s_accel.MapAwakeToInt1();
-  if (result < 0) { return; }
-
-  result = s_accel.StartMeasurement();
-  if (result < 0) { return; }
-
-  // Wait for AWAKE to clear.
-  LOG_INF("Waiting for AWAKE to clear...");
-  k_msleep(200);
-
-  while (s_accel.IsAwake()) {
-    LOG_INF("AWAKE still high, waiting...");
-    k_msleep(100);
-  }
-  LOG_INF("AWAKE cleared.");
-
-  // Step 2: Reconfigure with real thresholds.
-  result = s_accel.ConfigureActivity(M_MOTION_CONFIG);
-  if (result < 0) { return; }
-
-  LOG_INF("ADXL362 configured with %u sample inactivity timeout.", M_INACTIVITY_TIME_SAMPLES);
-}
-
-static void configureLightSensor()
+static bool configureLightSensor()
 {
   LOG_INF("Configuring BH1749...");
 
   int result { s_light.Init() };
   if (result < 0) {
     LOG_ERR("BH1749 init failed: %d!", result);
-    return;
+    return false;
   }
 
-  // Init() now configures 1x gain, 120ms mode (same as Zephyr driver defaults).
   LOG_INF("BH1749 configured.");
+  return true;
 }
 
-static bool readLight()
+static bool readLight(fridge::LightReading& reading)
 {
-  int result { s_light.Read(s_lightReading) };
+  int result { s_light.Read(reading) };
+  if (result == -EAGAIN) {
+    // Data not ready yet, not an error.
+    return false;
+  }
   if (result < 0) {
     LOG_ERR("Light read failed: %d!", result);
     return false;
   }
 
-  s_lightReading.deviceId = M_DEVICE_ID;
-  LOG_INF("Light: R=%u G=%u B=%u IR=%u.",
-          s_lightReading.red, s_lightReading.green, s_lightReading.blue, s_lightReading.ir);
+  reading.deviceId = M_DEVICE_ID;
   return true;
 }
 
+static void configureIntPin()
+{
+  // Configure INT pin as input. The devicetree specifies GPIO_ACTIVE_LOW,
+  // so gpio_pin_get_dt() returns 1 when the interrupt is asserted (physical LOW).
+  int result = gpio_pin_configure_dt(&s_lightInt, GPIO_INPUT);
+  if (result < 0) {
+    LOG_ERR("Failed to configure INT pin: %d!", result);
+    return;
+  }
+
+  LOG_INF("INT pin configured: port=%s, pin=%u.", s_lightInt.port->name, s_lightInt.pin);
+}
+
+#if defined(CONFIG_BT)
 static void onNusRx(const uint8_t* data, uint16_t length)
 {
-  // Gateway sends 4-byte timestamp.
   if (length == sizeof(uint32_t)) {
     uint32_t timestamp;
     memcpy(&timestamp, data, sizeof(timestamp));
@@ -244,51 +147,91 @@ static void onNusRx(const uint8_t* data, uint16_t length)
   }
 }
 
-static void sendLightReading()
+static bool initBle()
 {
   LOG_INF("Initialising BLE...");
 
   int result { s_ble.Init(onNusRx) };
   if (result < 0) {
     LOG_ERR("BLE init failed: %d!", result);
-    return;
+    return false;
   }
 
-  result = s_ble.StartAdvertising();
+  s_bleInitialised = true;
+  return true;
+}
+
+static bool connectBle()
+{
+  if (!s_bleInitialised) {
+    if (!initBle()) {
+      return false;
+    }
+  }
+
+  LOG_INF("Starting BLE advertising...");
+
+  int result { s_ble.StartAdvertising() };
   if (result < 0) {
     LOG_ERR("Advertising start failed: %d!", result);
-    return;
+    return false;
   }
 
   LOG_INF("Waiting for gateway connection...");
   if (!s_ble.WaitForConnection(M_BLE_CONNECT_TIMEOUT_MS)) {
-    LOG_WRN("Connection timeout, skipping BLE transmission.");
-    return;
+    LOG_WRN("Connection timeout.");
+    return false;
   }
 
   if (!s_ble.WaitForNusEnabled(M_BLE_NUS_ENABLED_TIMEOUT_MS)) {
     LOG_WRN("NUS enable timeout.");
     s_ble.Disconnect();
-    return;
+    return false;
   }
 
-  // Small delay for gateway to send timestamp (optional).
-  k_msleep(100);
-
-  // Send light reading (10 bytes).
-  result = s_ble.SendEvent(reinterpret_cast<const uint8_t*>(&s_lightReading),
-                           sizeof(s_lightReading));
-  if (result < 0) {
-    LOG_ERR("Failed to send light reading: %d!", result);
-  } else {
-    LOG_INF("Light reading sent to gateway.");
-  }
-
-  // Brief delay before disconnect.
-  k_msleep(100);
-  s_ble.Disconnect();
-  k_msleep(100);
+  return true;
 }
+
+static bool sendOpenEvent(const fridge::LightReading& reading)
+{
+  fridge::FridgeOpenEvent event {
+    .deviceId  = M_DEVICE_ID,
+    .eventType = static_cast<uint8_t>(fridge::FridgeEventType::DoorOpen),
+    .red       = reading.red,
+    .green     = reading.green,
+    .blue      = reading.blue,
+    .ir        = reading.ir
+  };
+
+  int result { s_ble.SendEvent(reinterpret_cast<const uint8_t*>(&event), sizeof(event)) };
+  if (result < 0) {
+    LOG_ERR("Failed to send open event: %d!", result);
+    return false;
+  }
+
+  LOG_INF("Door OPEN event sent.");
+  return true;
+}
+
+static bool sendCloseEvent(uint16_t durationSecs, bool alert)
+{
+  fridge::FridgeCloseEvent event {
+    .deviceId     = M_DEVICE_ID,
+    .eventType    = static_cast<uint8_t>(alert ? fridge::FridgeEventType::DoorAlert
+                                               : fridge::FridgeEventType::DoorClose),
+    .durationSecs = durationSecs
+  };
+
+  int result { s_ble.SendEvent(reinterpret_cast<const uint8_t*>(&event), sizeof(event)) };
+  if (result < 0) {
+    LOG_ERR("Failed to send close event: %d!", result);
+    return false;
+  }
+
+  LOG_INF("Door %s event sent (duration=%u s).", alert ? "ALERT" : "CLOSE", durationSecs);
+  return true;
+}
+#endif // CONFIG_BT
 
 // ========== Main ==========
 
@@ -298,58 +241,140 @@ int main()
   uint32_t resetReason { nrfx_reset_reason_get() };
   nrfx_reset_reason_clear(resetReason);
 
-  LOG_INF("=== ADXL362 System OFF Wake Test ===");
+  LOG_INF("=== Fridge Light Monitor ===");
   logResetReason(resetReason);
 
   // Configure LED.
   gpio_pin_configure_dt(&s_led, GPIO_OUTPUT_INACTIVE);
 
-  // Check if we woke from System OFF.
-  if (resetReason & NRFX_RESET_REASON_OFF_MASK) {
-    // Check INT1 level to determine why we woke.
-    int pinLevel { gpio_pin_get_dt(&s_wakePin) };
-    LOG_INF("Woke from System OFF via GPIO! INT1 level: %d.", pinLevel);
+  // Configure INT pin.
+  configureIntPin();
 
-    if (pinLevel) {
-      // INT1 is HIGH = activity detected (drawer opened).
-      LOG_INF("Activity wake — doing work...");
-
-      // Init and read light sensor (LED must be OFF during measurement!).
-      configureLightSensor();
-
-      // Wait for measurement (BH1749 needs 120ms at default mode).
-      k_msleep(150);
-
-      bool lightOk { readLight() };
-
-      // LED on to indicate BLE activity.
-      gpio_pin_set_dt(&s_led, true);
-
-      if (lightOk) {
-        // Send to gateway over BLE.
-        sendLightReading();
-      }
-
-      gpio_pin_set_dt(&s_led, false);
-      LOG_INF("Wake work complete.");
-    } else {
-      // INT1 is LOW = inactivity detected (drawer settled).
-      // This happens when we slept with sense LOW and AWAKE cleared.
-      // Just go back to sleep with sense HIGH for next activity.
-      LOG_INF("Inactivity wake — AWAKE cleared, returning to sleep.");
-    }
-  } else {
-    LOG_INF("Normal boot (not from System OFF).");
-
-    // Configure ADXL362 on fresh boot only.
-    configureAdxl362();
-
-    LOG_INF("Will enter System OFF in 2 seconds...");
-    k_msleep(2000);
+  // Configure BH1749.
+  if (!configureLightSensor()) {
+    LOG_ERR("Failed to configure light sensor, halting!");
+    return -1;
   }
 
-  // Go (back) to System OFF.
-  enterSystemOff();
+  // Wait for first valid measurement.
+  k_msleep(150);
+
+  LOG_INF("Entering main polling loop...");
+  LOG_INF("  Open threshold: green > %u", M_LIGHT_THRESHOLD_OPEN);
+  LOG_INF("  Close threshold: green < %u", M_LIGHT_THRESHOLD_CLOSE);
+
+  fridge::LightReading reading {};
+  uint32_t doorOpenTime { 0 };
+  bool alertSent { false };
+
+  while (true) {
+    // Wait for next measurement.
+    uint32_t pollInterval { (s_doorState == DoorState::Closed)
+                            ? M_POLL_INTERVAL_IDLE_MS
+                            : M_POLL_INTERVAL_OPEN_MS };
+    k_msleep(pollInterval);
+
+    // Read light sensor.
+    if (!readLight(reading)) {
+      continue;
+    }
+
+    uint16_t green { reading.green };
+
+    // Also log INT pin state periodically.
+    int intPin = gpio_pin_get_dt(&s_lightInt);
+
+    // State machine.
+    switch (s_doorState) {
+      case DoorState::Closed:
+        if (green > M_LIGHT_THRESHOLD_OPEN) {
+          // Door just opened!
+          LOG_INF("*** DOOR OPENED (green=%u > %u, INT=%d) ***",
+                  green, M_LIGHT_THRESHOLD_OPEN, intPin);
+          s_doorState = DoorState::Open;
+          doorOpenTime = k_uptime_get_32();
+          alertSent = false;
+
+          // LED on.
+          gpio_pin_set_dt(&s_led, true);
+
+#if defined(CONFIG_BT)
+          if (connectBle()) {
+            k_msleep(100);
+            sendOpenEvent(reading);
+            k_msleep(100);
+            s_ble.Disconnect();
+            k_msleep(100);
+          }
+#endif
+
+          gpio_pin_set_dt(&s_led, false);
+        } else {
+          // Still closed, occasional log.
+          static uint32_t lastLog { 0 };
+          if (k_uptime_get_32() - lastLog > 10000) {
+            LOG_INF("Door closed, green=%u, INT=%d.", green, intPin);
+            lastLog = k_uptime_get_32();
+          }
+        }
+        break;
+
+      case DoorState::Open:
+        {
+          uint32_t elapsedMs { k_uptime_get_32() - doorOpenTime };
+          uint16_t elapsedSecs { static_cast<uint16_t>(elapsedMs / 1000) };
+
+          // Check for timeout alert.
+          if (!alertSent && (elapsedSecs >= M_DOOR_OPEN_TIMEOUT_SECS)) {
+            LOG_WRN("*** DOOR OPEN TIMEOUT (%u s) ***", elapsedSecs);
+
+            gpio_pin_set_dt(&s_led, true);
+
+#if defined(CONFIG_BT)
+            if (connectBle()) {
+              k_msleep(100);
+              sendCloseEvent(elapsedSecs, true);  // Alert event.
+              k_msleep(100);
+              s_ble.Disconnect();
+              k_msleep(100);
+            }
+#endif
+
+            gpio_pin_set_dt(&s_led, false);
+            alertSent = true;
+          }
+
+          // Check if door closed.
+          if (green < M_LIGHT_THRESHOLD_CLOSE) {
+            LOG_INF("*** DOOR CLOSED (green=%u < %u, duration=%u s, INT=%d) ***",
+                    green, M_LIGHT_THRESHOLD_CLOSE, elapsedSecs, intPin);
+            s_doorState = DoorState::Closed;
+
+            gpio_pin_set_dt(&s_led, true);
+
+#if defined(CONFIG_BT)
+            if (connectBle()) {
+              k_msleep(100);
+              sendCloseEvent(elapsedSecs, false);  // Normal close event.
+              k_msleep(100);
+              s_ble.Disconnect();
+              k_msleep(100);
+            }
+#endif
+
+            gpio_pin_set_dt(&s_led, false);
+          } else {
+            // Still open, log periodically.
+            static uint32_t lastOpenLog { 0 };
+            if (k_uptime_get_32() - lastOpenLog > 5000) {
+              LOG_INF("Door open, green=%u, elapsed=%u s, INT=%d.", green, elapsedSecs, intPin);
+              lastOpenLog = k_uptime_get_32();
+            }
+          }
+        }
+        break;
+    }
+  }
 
   return 0;
 }

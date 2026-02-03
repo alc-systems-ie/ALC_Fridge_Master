@@ -1,5 +1,4 @@
-/* Override ADXL362 INT1 to ensure active-high for wake. */
-&adxl362 {
-	status = "okay";
-	int1-gpios = <&gpio0 19 GPIO_ACTIVE_HIGH>;
-};
+/* BH1749 INT pin is already defined in thingy53_nrf5340_common.dtsi as:
+ *   int-gpios = <&gpio1 5 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+ * No overlay needed.
+ */
