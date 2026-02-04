@@ -215,26 +215,11 @@ namespace fridge
 
     if (!m_ready) { return -ENODEV; }
 
-    // Check if data is valid.
-    // Reading MODE_CONTROL2 clears the VALID flag, so only read once.
-    uint8_t ctrl2 { };
-    int result { readRegister(M_REG_MODE_CONTROL2, ctrl2) };
-    if (result < 0) {
-      LOG_ERR("Failed to read MODE_CONTROL2: %d!", result);
-      return result;
-    }
-
-    LOG_DBG("MODE_CONTROL2: 0x%02X", ctrl2);
-
-    if (!(ctrl2 & M_VALID_MASK)) {
-      LOG_INF("Data not valid yet (ctrl2=0x%02X).", ctrl2);
-      return -EAGAIN;
-    }
-
     // Read all color data (R, G, B, skip 2 bytes, IR) = 10 bytes from 0x50.
     // Layout: RED_L, RED_H, GREEN_L, GREEN_H, BLUE_L, BLUE_H, (2 reserved), IR_L, IR_H.
+    // Note: Caller should use WaitForValid() before calling this if fresh data is needed.
     uint8_t buffer[10] { };
-    result = readRegisters(M_REG_RED_DATA_LSB, buffer, sizeof(buffer));
+    int result { readRegisters(M_REG_RED_DATA_LSB, buffer, sizeof(buffer)) };
     if (result < 0) {
       LOG_ERR("Failed to read color data: %d!", result);
       return result;
@@ -279,8 +264,8 @@ namespace fridge
       return result;
     }
 
-    // Set persistence to trigger after each measurement for testing.
-    result = writeRegister(M_REG_PERSISTENCE, M_PERSISTENCE_ACTIVE_END);
+    // Set persistence to 4 consecutive samples to filter transient changes.
+    result = writeRegister(M_REG_PERSISTENCE, M_PERSISTENCE_4_SAMPLES);
     if (result < 0) {
       LOG_ERR("Failed to set persistence: %d!", result);
       return result;
@@ -293,7 +278,7 @@ namespace fridge
     uint16_t readHigh { static_cast<uint16_t>(verifyBuffer[0] | (verifyBuffer[1] << 8)) };
     uint16_t readLow { static_cast<uint16_t>(verifyBuffer[2] | (verifyBuffer[3] << 8)) };
 
-    LOG_INF("BH1749 thresholds: high=%u (read=%u), low=%u (read=%u), persist=1.",
+    LOG_INF("BH1749 thresholds: high=%u (read=%u), low=%u (read=%u), persist=4.",
             thresholdHigh, readHigh, thresholdLow, readLow);
 
     return OK;
@@ -400,4 +385,32 @@ namespace fridge
     return readRegister(M_REG_INTERRUPT, status);
   }
 
-  } // namespace fridge
+  bool Bh1749Light::WaitForValid(uint32_t timeoutMs)
+  {
+    if (!m_ready) { return false; }
+
+    constexpr uint32_t M_POLL_INTERVAL_MS { 10 };
+    uint32_t elapsed { 0 };
+
+    while (elapsed < timeoutMs) {
+      uint8_t ctrl2 { };
+      int result { readRegister(M_REG_MODE_CONTROL2, ctrl2) };
+      if (result < 0) {
+        LOG_ERR("Failed to read MODE_CONTROL2: %d!", result);
+        return false;
+      }
+
+      if (ctrl2 & M_VALID_MASK) {
+        LOG_DBG("Valid data ready after %u ms.", elapsed);
+        return true;
+      }
+
+      k_msleep(M_POLL_INTERVAL_MS);
+      elapsed += M_POLL_INTERVAL_MS;
+    }
+
+    LOG_WRN("Timeout waiting for valid data (%u ms).", timeoutMs);
+    return false;
+  }
+
+} // namespace fridge

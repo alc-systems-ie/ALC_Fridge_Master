@@ -4,20 +4,26 @@
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/gatt.h>
+#include <zephyr/bluetooth/hci.h>
 #include <bluetooth/services/nus.h>
 #include <zephyr/logging/log.h>
 
 LOG_MODULE_REGISTER(ble_nus, LOG_LEVEL_INF);
 
-namespace fridge 
+namespace fridge
 {
 
  // ========== Static State ==========
 
+  static K_SEM_DEFINE(s_SemBtReady, 0, 1);
   static K_SEM_DEFINE(s_SemConnection, 0, 1);
   static K_SEM_DEFINE(s_SemNusEnabled, 0, 1);
   static struct bt_conn* s_currentConnection { nullptr };
   static NusRxCallback s_rxCallback { nullptr };
+  static bool s_nusEnabled { false };
+  static bool s_btReady { false };
+  static int s_btInitError { 0 };
+  static bool s_disconnectExpected { false };
 
   // ========== Advertising Data ==========
 
@@ -48,11 +54,14 @@ namespace fridge
 
   static void onDisconnected(struct bt_conn* connection, uint8_t reason)
   {
-    LOG_INF("Disconnected (reason %u).", reason);
+    if (!s_disconnectExpected) {
+      LOG_INF("Disconnected (reason %u).", reason);
+    }
     if (s_currentConnection) {
       bt_conn_unref(s_currentConnection);
       s_currentConnection = nullptr;
     }
+    s_nusEnabled = false;
   }
 
   BT_CONN_CB_DEFINE(s_connCallbacks) = {
@@ -74,9 +83,11 @@ namespace fridge
   {
     if (status == BT_NUS_SEND_STATUS_ENABLED) {
       LOG_INF("NUS notifications enabled.");
+      s_nusEnabled = true;
       k_sem_give(&s_SemNusEnabled);
     } else {
-      LOG_INF("NUS notifications disabled.");
+      // Disabled is expected during disconnect, don't log.
+      s_nusEnabled = false;
     }
   }
 
@@ -85,35 +96,86 @@ namespace fridge
     .send_enabled = onNusSendEnabled,
   };
 
+  // ========== BT Ready Callback ==========
+
+  static void onBtReady(int error)
+  {
+    if (error) {
+      LOG_ERR("Bluetooth init failed in callback: %d!", error);
+      s_btInitError = error;
+    } else {
+      LOG_INF("Bluetooth ready (callback).");
+      s_btReady = true;
+    }
+    k_sem_give(&s_SemBtReady);
+  }
+
   // ========== BleNus Implementation ==========
 
-  constexpr uint32_t M_NET_CORE_BOOT_MS { 2000 };
-
-  int BleNus::Init(NusRxCallback rxCallback)
+  int BleNus::StartInit(NusRxCallback rxCallback)
   {
-    constexpr int OK { 0 };
     s_rxCallback = rxCallback;
+    s_btReady = false;
+    s_btInitError = 0;
+    s_disconnectExpected = false;
+    s_nusEnabled = false;
 
-    // Wait for the network core to boot after System OFF wake before
-    // attempting BLE init. Without this delay, the IPC endpoint binding
-    // fails and leaves the HCI transport in a bad state.
-    k_msleep(M_NET_CORE_BOOT_MS);
-
-    int result { bt_enable(nullptr) };
-    if (result == -EALREADY) { result = 0; }
+    // Start BLE init with callback - returns immediately.
+    // The callback will be invoked when BT subsystem is ready
+    // (including net core boot on nRF5340).
+    int result { bt_enable(onBtReady) };
+    if (result == -EALREADY) {
+      // Already enabled, mark as ready.
+      s_btReady = true;
+      k_sem_give(&s_SemBtReady);
+      return 0;
+    }
     if (result < 0) {
-      LOG_ERR("Bluetooth init failed: %d!", result);
+      LOG_ERR("bt_enable() failed: %d!", result);
       return result;
     }
-    LOG_INF("Bluetooth initialised.");
 
-    result = bt_nus_init(&s_nusCallbacks);
+    LOG_INF("BLE init started (non-blocking).");
+    return 0;
+  }
+
+  bool BleNus::WaitForReady(uint32_t timeoutMs)
+  {
+    if (s_btReady) {
+      return true;
+    }
+
+    if (k_sem_take(&s_SemBtReady, K_MSEC(timeoutMs)) != 0) {
+      LOG_ERR("Timeout waiting for BT ready!");
+      return false;
+    }
+
+    return s_btReady && (s_btInitError == 0);
+  }
+
+  bool BleNus::IsReady()
+  {
+    return s_btReady && (s_btInitError == 0);
+  }
+
+  int BleNus::CompleteInit()
+  {
+    if (!s_btReady) {
+      LOG_ERR("BT not ready, cannot complete init!");
+      return -EAGAIN;
+    }
+    if (s_btInitError != 0) {
+      return s_btInitError;
+    }
+
+    int result { bt_nus_init(&s_nusCallbacks) };
     if (result < 0) {
       LOG_ERR("NUS init failed: %d!", result);
       return result;
     }
 
-    return OK;
+    LOG_INF("NUS initialised.");
+    return 0;
   }
 
   int BleNus::StartAdvertising()
@@ -142,6 +204,16 @@ namespace fridge
   {
     k_sem_reset(&s_SemNusEnabled);
     return k_sem_take(&s_SemNusEnabled, K_MSEC(timeoutMs)) == 0;
+  }
+
+  bool BleNus::IsConnected()
+  {
+    return s_currentConnection != nullptr;
+  }
+
+  bool BleNus::IsNusEnabled()
+  {
+    return s_nusEnabled;
   }
 
   int BleNus::SendEvent(const uint8_t* data, uint16_t length)
@@ -174,8 +246,60 @@ namespace fridge
 
   void BleNus::Disconnect()
   {
+    s_disconnectExpected = true;
+    s_nusEnabled = false;
+
+    // Don't actively disconnect - the gateway disconnects after receiving
+    // our packet, and we're about to enter System OFF anyway. Just clean
+    // up our connection reference to avoid any pending operations.
     if (s_currentConnection) {
-      bt_conn_disconnect(s_currentConnection, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+      bt_conn_unref(s_currentConnection);
+      s_currentConnection = nullptr;
     }
+  }
+
+  int8_t BleNus::GetRssi()
+  {
+    constexpr int8_t M_RSSI_INVALID { 0 };
+
+    if (!s_currentConnection) {
+      LOG_WRN("No connection for RSSI read.");
+      return M_RSSI_INVALID;
+    }
+
+    // Get HCI connection handle.
+    uint16_t handle { 0 };
+    int result { bt_hci_get_conn_handle(s_currentConnection, &handle) };
+    if (result < 0) {
+      LOG_ERR("Failed to get connection handle: %d!", result);
+      return M_RSSI_INVALID;
+    }
+
+    struct net_buf* rsp { nullptr };
+    struct net_buf* buf { bt_hci_cmd_create(BT_HCI_OP_READ_RSSI, sizeof(uint16_t)) };
+    if (!buf) {
+      LOG_ERR("Failed to create HCI command buffer!");
+      return M_RSSI_INVALID;
+    }
+
+    // Add connection handle to command.
+    net_buf_add_le16(buf, handle);
+
+    result = bt_hci_cmd_send_sync(BT_HCI_OP_READ_RSSI, buf, &rsp);
+    if (result < 0) {
+      LOG_ERR("Failed to send HCI read RSSI command: %d!", result);
+      return M_RSSI_INVALID;
+    }
+
+    // Parse response: status (1 byte) + handle (2 bytes) + rssi (1 byte).
+    struct bt_hci_rp_read_rssi* rssiRsp {
+      reinterpret_cast<struct bt_hci_rp_read_rssi*>(rsp->data)
+    };
+    int8_t rssi { rssiRsp->rssi };
+
+    net_buf_unref(rsp);
+
+    LOG_INF("Connection RSSI: %d dBm.", rssi);
+    return rssi;
   }
 } 

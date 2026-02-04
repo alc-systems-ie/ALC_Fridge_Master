@@ -5,9 +5,42 @@
 
 namespace fridge {
 
+// ========== Device Configuration ==========
+
+constexpr char M_DEVICE_ID[] { "ffff0000111122223333444455551111" };
+
+// ========== Event Types ==========
+
+enum class FridgeEventType : uint8_t {
+  DoorOpen  = 1,
+  DoorClose = 2,
+  DoorAlert = 3,  // Door left open too long.
+};
+
+// ========== Packet Structures ==========
+
+/**
+ * @brief Gateway packet for fridge events.
+ *
+ * Unified packet format for all fridge events sent to gateway.
+ * Total size: 60 bytes.
+ */
+struct __packed FridgeGatewayPacket {
+  char     deviceId[32];        // 128-bit UUID as hex string.
+  char     deviceName[16];      // Device name (e.g., "FridgeMon").
+  uint8_t  eventType;           // FridgeEventType value.
+  uint16_t durationSecs;        // Door open duration (0 for open event).
+  uint16_t red;                 // Light sensor data for diagnostics.
+  uint16_t green;
+  uint16_t blue;
+  uint16_t ir;
+  int8_t   rssiDbm;             // Link quality at transmission.
+};  // 60 bytes
+
+/**
+ * @brief Internal light reading structure.
+ */
 struct __packed LightReading {
-  uint8_t  deviceId;
-  uint8_t  reserved;
   uint16_t red;
   uint16_t green;
   uint16_t blue;
@@ -66,6 +99,13 @@ public:
    * @return Green channel value from last Read() call.
    */
   uint16_t GetGreen() const { return m_lastGreen; }
+
+  /**
+   * @brief Wait for valid measurement data.
+   * @param timeoutMs Maximum time to wait in milliseconds.
+   * @return True if valid data is available, false on timeout.
+   */
+  bool WaitForValid(uint32_t timeoutMs);
 
   /**
    * @brief Dump all interrupt-related registers for diagnostics.

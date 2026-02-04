@@ -12,29 +12,6 @@
 
 namespace fridge
 {
-  // ========== Event Types ==========
-
-  enum class FridgeEventType : uint8_t {
-    DoorOpen  = 0x01,
-    DoorClose = 0x02,
-    DoorAlert = 0x03,  // Door left open too long.
-  };
-
-  struct __packed FridgeOpenEvent {
-    uint8_t  deviceId;
-    uint8_t  eventType;   // FridgeEventType::DoorOpen
-    uint16_t red;
-    uint16_t green;
-    uint16_t blue;
-    uint16_t ir;
-  };  // 10 bytes
-
-  struct __packed FridgeCloseEvent {
-    uint8_t  deviceId;
-    uint8_t  eventType;    // FridgeEventType::DoorClose or DoorAlert
-    uint16_t durationSecs; // Visit duration.
-  };  // 4 bytes
-
   // ========== Callbacks ==========
 
   /** @brief Callback type for data received via NUS RX characteristic. */
@@ -51,8 +28,21 @@ namespace fridge
 
       // ========== Initialisation ==========
 
-      /** @brief Initialise BLE subsystem and register NUS service. */
-      int Init(NusRxCallback rxCallback);
+      /**
+       * @brief Start BLE subsystem initialisation (non-blocking).
+       * Kicks off bt_enable with a callback. Returns immediately.
+       * Use WaitForReady() or IsReady() to check when complete.
+       */
+      int StartInit(NusRxCallback rxCallback);
+
+      /** @brief Check if BLE subsystem is ready (non-blocking). */
+      bool IsReady();
+
+      /** @brief Block until BLE subsystem is ready or timeout expires. */
+      bool WaitForReady(uint32_t timeoutMs);
+
+      /** @brief Complete initialisation by registering NUS service. Call after BT is ready. */
+      int CompleteInit();
 
       // ========== Advertising ==========
 
@@ -67,8 +57,17 @@ namespace fridge
       /** @brief Block until NUS notifications are enabled or timeout expires. */
       bool WaitForNusEnabled(uint32_t timeoutMs);
 
+      /** @brief Check if currently connected (non-blocking). */
+      bool IsConnected();
+
+      /** @brief Check if NUS notifications are enabled (non-blocking). */
+      bool IsNusEnabled();
+
       /** @brief Disconnect the current connection. */
       void Disconnect();
+
+      /** @brief Get the current connection RSSI. */
+      int8_t GetRssi();
 
       // ========== Data Transfer ==========
 
