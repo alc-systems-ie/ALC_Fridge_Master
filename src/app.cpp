@@ -67,6 +67,7 @@ namespace fridge
   struct RetainedData {
     CalibrationData calibration;    // Light sensor calibration.
     AppState lastState;             // State before System OFF.
+    bool detectingDoorOpen;         // True = waiting for door open, false = waiting for door close.
     uint32_t crc;                   // CRC32 for validation.
   };
 
@@ -647,10 +648,10 @@ namespace fridge
   void App::sendDoorOpenAndSleep()
   {
     // The BH1749 interrupt triggered, telling us the light level crossed a threshold.
-    // We don't need to re-read the sensor - just check which direction we were detecting.
+    // Use the retained flag to know which direction we were detecting - no sensor read needed.
     //
-    // If we were detecting door-open (high threshold): light went HIGH -> send OPEN event.
-    // If we were detecting door-close (low threshold): light went LOW -> just reconfigure.
+    // If detectingDoorOpen=true:  we were waiting for door open -> send OPEN event.
+    // If detectingDoorOpen=false: we were waiting for door close -> just reconfigure for door open.
 
     // Initialise sensor to reconfigure thresholds (resets it but we need I2C access).
     if (!initLightSensor()) {
@@ -658,21 +659,16 @@ namespace fridge
       return;
     }
 
-    // Quick read to determine if this is door-open or door-close.
-    // The sensor was just reset, so read what we can (may be stale but direction is clear).
-    LightReading reading {};
-    s_light.Read(reading);
-    m_doorOpenLight = reading.green;
-
-    // If light is low, this was a door-close wake. Reconfigure for door-open and sleep.
-    if (m_doorOpenLight < m_calibration.wakeThreshold) {
-      LOG_INF("Door closed (green=%u) - reconfiguring for door-open detection.", m_doorOpenLight);
+    // Check the retained flag to determine wake type.
+    if (!s_retained.detectingDoorOpen) {
+      // We were detecting door close - this is a door-close wake.
+      LOG_INF("Door closed - reconfiguring for door-open detection.");
       configureLightSensorForWake();
       return;
     }
 
     // Door is open - send OPEN event.
-    LOG_INF("Door opened (green=%u) - sending OPEN event.", m_doorOpenLight);
+    LOG_INF("Door opened - sending OPEN event.");
 
     // Start BLE.
     int bleResult { s_ble.StartInit(nullptr) };
@@ -768,6 +764,10 @@ namespace fridge
     // Clear any pending interrupt.
     s_light.ClearInterrupt();
 
+    // Save detection mode to retained memory so we know on next wake.
+    s_retained.detectingDoorOpen = true;
+    saveRetainedData();
+
     LOG_INF("Wake configured: trigger on green > %u (door open detection).", m_calibration.wakeThreshold);
   }
 
@@ -799,6 +799,10 @@ namespace fridge
 
     // Clear any pending interrupt.
     s_light.ClearInterrupt();
+
+    // Save detection mode to retained memory so we know on next wake.
+    s_retained.detectingDoorOpen = false;
+    saveRetainedData();
 
     LOG_INF("Wake configured: trigger on green < %u (door close detection).", closeThreshold);
   }
@@ -1038,6 +1042,32 @@ namespace fridge
                            reinterpret_cast<const uint8_t*>(&s_retained),
                            sizeof(s_retained));
       }
+    }
+  }
+
+  void App::saveRetainedData()
+  {
+    // Quick save of retained data (detectingDoorOpen flag, etc.) without full calibration save.
+    if constexpr (!M_HAS_RETAINED_MEM) {
+      return;
+    }
+
+    if (!device_is_ready(s_retainedMemDevice)) {
+      LOG_ERR("Retained memory device not ready!");
+      return;
+    }
+
+    // Compute CRC over data (excluding CRC field itself).
+    uint32_t crc { crc32_ieee(reinterpret_cast<const uint8_t*>(&s_retained),
+                              M_RETAINED_CRC_OFFSET) };
+    s_retained.crc = sys_cpu_to_le32(crc);
+
+    // Write to retained memory.
+    int result { retained_mem_write(s_retainedMemDevice, 0,
+                                    reinterpret_cast<const uint8_t*>(&s_retained),
+                                    sizeof(s_retained)) };
+    if (result < 0) {
+      LOG_ERR("Failed to write retained memory: %d!", result);
     }
   }
 

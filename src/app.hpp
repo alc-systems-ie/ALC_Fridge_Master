@@ -169,6 +169,7 @@ namespace fridge
 
       bool loadCalibration();
       void saveCalibration();
+      void saveRetainedData();
       void clearCalibration();
       bool isCalibrated() const;
 
