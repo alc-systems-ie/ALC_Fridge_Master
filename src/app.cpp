@@ -670,27 +670,37 @@ namespace fridge
     // Door is open - send OPEN event.
     LOG_INF("Door opened - sending OPEN event.");
 
+    // TX power settings.
+    // Default SoC power is 0 dBm, with POUTB FEM (+10dB) = +10 dBm at antenna.
+    constexpr int8_t M_TX_POWER_DBM { 0 };
+
+    // Connect to gateway and send OPEN event.
+    bool sent { false };
+    int8_t rssi { 0 };
+
     // Start BLE.
     int bleResult { s_ble.StartInit(nullptr) };
     if (bleResult < 0) {
       LOG_ERR("BLE start init failed: %d!", bleResult);
     }
 
-    // Connect to gateway and send OPEN event.
-    bool sent { false };
-    int8_t rssi { 0 };
+    if (bleResult == 0 && s_ble.WaitForReady(M_BLE_READY_TIMEOUT_MS)) {
+      if (s_ble.CompleteInit() == 0) {
+        // Set advertising TX power before starting advertising.
+        int8_t actualAdvPower { s_ble.SetAdvTxPower(M_TX_POWER_DBM) };
+        LOG_INF("ADV TX power: %d dBm (antenna ~%d dBm with FEM).", actualAdvPower, actualAdvPower + 10);
 
-    if (bleResult == 0) {
-      if (s_ble.WaitForReady(M_BLE_READY_TIMEOUT_MS)) {
-        if (s_ble.CompleteInit() == 0) {
-          if (s_ble.StartAdvertising() == 0) {
-            if (s_ble.WaitForConnection(M_BLE_CONNECT_TIMEOUT_MS)) {
-              if (s_ble.WaitForNusEnabled(M_BLE_NUS_ENABLED_TIMEOUT_MS)) {
-                rssi = s_ble.GetRssi();
-                sent = sendOpenEvent(rssi);
-                if (sent) {
-                  LOG_INF("Sent OPEN packet (rssi=%d dBm).", rssi);
-                }
+        if (s_ble.StartAdvertising() == 0) {
+          if (s_ble.WaitForConnection(M_BLE_CONNECT_TIMEOUT_MS)) {
+            // Set connection TX power after connection established.
+            int8_t actualConnPower { s_ble.SetTxPower(M_TX_POWER_DBM) };
+            LOG_INF("CONN TX power: %d dBm (antenna ~%d dBm with FEM).", actualConnPower, actualConnPower + 10);
+
+            if (s_ble.WaitForNusEnabled(M_BLE_NUS_ENABLED_TIMEOUT_MS)) {
+              rssi = s_ble.GetRssi();
+              sent = sendOpenEvent(rssi);
+              if (sent) {
+                LOG_INF("Sent OPEN packet (rssi=%d dBm).", rssi);
               }
             }
           }

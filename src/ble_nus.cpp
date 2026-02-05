@@ -5,6 +5,8 @@
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/hci.h>
+#include <zephyr/bluetooth/hci_vs.h>
+#include <zephyr/sys/byteorder.h>
 #include <bluetooth/services/nus.h>
 #include <zephyr/logging/log.h>
 
@@ -310,16 +312,17 @@ namespace fridge
       return M_RSSI_INVALID;
     }
 
-    struct net_buf* rsp { nullptr };
-    struct net_buf* buf { bt_hci_cmd_create(BT_HCI_OP_READ_RSSI, sizeof(uint16_t)) };
+    // Allocate HCI command buffer.
+    struct net_buf* buf { bt_hci_cmd_alloc(K_FOREVER) };
     if (!buf) {
-      LOG_ERR("Failed to create HCI command buffer!");
+      LOG_ERR("Failed to allocate HCI command buffer!");
       return M_RSSI_INVALID;
     }
 
     // Add connection handle to command.
     net_buf_add_le16(buf, handle);
 
+    struct net_buf* rsp { nullptr };
     result = bt_hci_cmd_send_sync(BT_HCI_OP_READ_RSSI, buf, &rsp);
     if (result < 0) {
       LOG_ERR("Failed to send HCI read RSSI command: %d!", result);
@@ -336,5 +339,97 @@ namespace fridge
 
     LOG_INF("Connection RSSI: %d dBm.", rssi);
     return rssi;
+  }
+
+  int8_t BleNus::SetTxPower(int8_t powerDbm)
+  {
+    constexpr int8_t M_TX_POWER_ERROR { 127 };
+
+    if (!s_currentConnection) {
+      LOG_WRN("No connection for TX power set.");
+      return M_TX_POWER_ERROR;
+    }
+
+    // Get connection handle for HCI command.
+    uint16_t connectionHandle { 0 };
+    int result { bt_hci_get_conn_handle(s_currentConnection, &connectionHandle) };
+    if (result < 0) {
+      LOG_WRN("Failed to get conn handle: %d.", result);
+      return M_TX_POWER_ERROR;
+    }
+
+    // Allocate HCI command buffer.
+    net_buf* buffer { bt_hci_cmd_alloc(K_FOREVER) };
+    if (!buffer) {
+      LOG_WRN("Failed to allocate HCI cmd buffer.");
+      return M_TX_POWER_ERROR;
+    }
+
+    // Add TX power parameters to command.
+    bt_hci_cp_vs_write_tx_power_level* params {
+      static_cast<bt_hci_cp_vs_write_tx_power_level*>(net_buf_add(buffer, sizeof(*params)))
+    };
+    params->handle = sys_cpu_to_le16(connectionHandle);
+    params->handle_type = BT_HCI_VS_LL_HANDLE_TYPE_CONN;
+    params->tx_power_level = powerDbm;
+
+    // Send command and wait for response.
+    net_buf* response { nullptr };
+    result = bt_hci_cmd_send_sync(BT_HCI_OP_VS_WRITE_TX_POWER_LEVEL, buffer, &response);
+    if (result < 0) {
+      LOG_WRN("Set TX power cmd failed: %d.", result);
+      return M_TX_POWER_ERROR;
+    }
+
+    // Extract actual TX power from response.
+    bt_hci_rp_vs_write_tx_power_level* responseParams {
+      reinterpret_cast<bt_hci_rp_vs_write_tx_power_level*>(response->data)
+    };
+    int8_t actualPower { responseParams->selected_tx_power };
+
+    net_buf_unref(response);
+
+    LOG_INF("TX power set: requested=%d dBm, actual=%d dBm.", powerDbm, actualPower);
+    return actualPower;
+  }
+
+  int8_t BleNus::SetAdvTxPower(int8_t powerDbm)
+  {
+    constexpr int8_t M_TX_POWER_ERROR { 127 };
+
+    // Allocate HCI command buffer.
+    net_buf* buffer { bt_hci_cmd_alloc(K_FOREVER) };
+    if (!buffer) {
+      LOG_WRN("Failed to allocate HCI cmd buffer.");
+      return M_TX_POWER_ERROR;
+    }
+
+    // Add TX power parameters for advertising.
+    // Handle 0x0000 is used for advertising set 0 (legacy advertising).
+    bt_hci_cp_vs_write_tx_power_level* params {
+      static_cast<bt_hci_cp_vs_write_tx_power_level*>(net_buf_add(buffer, sizeof(*params)))
+    };
+    params->handle = sys_cpu_to_le16(0x0000);
+    params->handle_type = BT_HCI_VS_LL_HANDLE_TYPE_ADV;
+    params->tx_power_level = powerDbm;
+
+    // Send command and wait for response.
+    net_buf* response { nullptr };
+    int result { bt_hci_cmd_send_sync(BT_HCI_OP_VS_WRITE_TX_POWER_LEVEL, buffer, &response) };
+    if (result < 0) {
+      LOG_WRN("Set ADV TX power cmd failed: %d.", result);
+      return M_TX_POWER_ERROR;
+    }
+
+    // Extract actual TX power from response.
+    bt_hci_rp_vs_write_tx_power_level* responseParams {
+      reinterpret_cast<bt_hci_rp_vs_write_tx_power_level*>(response->data)
+    };
+    int8_t actualPower { responseParams->selected_tx_power };
+
+    net_buf_unref(response);
+
+    LOG_INF("ADV TX power set: requested=%d dBm, actual=%d dBm.", powerDbm, actualPower);
+    return actualPower;
   }
 } 

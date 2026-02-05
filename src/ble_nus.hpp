@@ -72,6 +72,31 @@ namespace fridge
       /** @brief Get the current connection RSSI. */
       int8_t GetRssi();
 
+      // ========== TX Power Control ==========
+
+      /**
+       * @brief Set TX power for current connection.
+       *
+       * Uses Nordic vendor-specific HCI command to set TX power.
+       * With nRF21540 FEM in POUTB mode (+10dB gain), effective antenna power is:
+       *   antenna_power = SoC_power + 10dB
+       *
+       * @param powerDbm Desired SoC TX power in dBm (typically -20 to +3).
+       * @return Actual TX power set, or 127 on error.
+       */
+      int8_t SetTxPower(int8_t powerDbm);
+
+      /**
+       * @brief Set TX power for advertising.
+       *
+       * Must be called before StartAdvertising() to affect advertising packets.
+       * Uses Nordic vendor-specific HCI command.
+       *
+       * @param powerDbm Desired SoC TX power in dBm.
+       * @return Actual TX power set, or 127 on error.
+       */
+      int8_t SetAdvTxPower(int8_t powerDbm);
+
       // ========== Data Transfer ==========
 
       /**
