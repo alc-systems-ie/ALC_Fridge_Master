@@ -1,4 +1,32 @@
 /* BH1749 INT pin is already defined in thingy53_nrf5340_common.dtsi as:
  *   int-gpios = <&gpio1 5 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
- * No overlay needed.
+ * No overlay needed for that.
  */
+
+/* Retained memory region for calibration persistence across System OFF.
+ * Uses the last 4KB of SRAM which remains powered during System OFF.
+ */
+/ {
+  sram0_retained: sram0_retained@2006f000 {
+    compatible = "zephyr,memory-region", "mmio-sram";
+    reg = <0x2006f000 DT_SIZE_K(4)>;
+    zephyr,memory-region = "RetainedMem";
+    status = "okay";
+
+    retainedmem0: retainedmem {
+      compatible = "zephyr,retained-ram";
+      status = "okay";
+    };
+  };
+
+  aliases {
+    retainedmemdevice = &retainedmem0;
+  };
+};
+
+/* Shrink SRAM to avoid overlap with retained region.
+ * Default is 448KB, we reduce to 444KB (448 - 4 = 444).
+ */
+&sram0_image {
+  reg = <0x20000000 DT_SIZE_K(444)>;
+};

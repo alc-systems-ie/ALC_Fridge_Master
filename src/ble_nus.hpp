@@ -66,6 +66,9 @@ namespace fridge
       /** @brief Disconnect the current connection. */
       void Disconnect();
 
+      /** @brief Reset state to allow reconnection after disconnect. */
+      void PrepareReconnect();
+
       /** @brief Get the current connection RSSI. */
       int8_t GetRssi();
 

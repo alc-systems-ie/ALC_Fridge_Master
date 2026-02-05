@@ -135,20 +135,28 @@ namespace fridge
       return -ENODEV;
     }
 
-    // Enable RGB measurement first (Zephyr driver order).
-    result = writeRegister(M_REG_MODE_CONTROL2, M_RGB_EN);
-    if (result < 0) {
-      LOG_ERR("Failed to enable RGB: %d!", result);
-      return result;
-    }
-
     // Set configuration: 32x gain, 120ms mode.
+    // Must write MODE_CONTROL1 before enabling measurement in MODE_CONTROL2.
     // 0x02 = 120ms, 0x18 = RGB 32x (bits 4:3 = 11), 0x60 = IR 32x (bits 6:5 = 11)
     constexpr uint8_t MODE_CONTROL1_32X { 0x02 | 0x18 | 0x60 };  // = 0x7A
     result = writeRegister(M_REG_MODE_CONTROL1, MODE_CONTROL1_32X);
     if (result < 0) {
       LOG_ERR("Failed to set mode control 1: %d!", result);
       return result;
+    }
+
+    // Enable RGB measurement after setting gain/timing.
+    result = writeRegister(M_REG_MODE_CONTROL2, M_RGB_EN);
+    if (result < 0) {
+      LOG_ERR("Failed to enable RGB: %d!", result);
+      return result;
+    }
+
+    // Verify gain was set correctly.
+    uint8_t modeCtrl1Readback;
+    result = readRegister(M_REG_MODE_CONTROL1, modeCtrl1Readback);
+    if (result == 0) {
+      LOG_INF("MODE_CONTROL1: 0x%02X (expected 0x7A).", modeCtrl1Readback);
     }
 
     // Clear any pending interrupt from power-on.

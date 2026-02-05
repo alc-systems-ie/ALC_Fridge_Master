@@ -5,6 +5,7 @@ project(fridge_monitor)
 
 target_sources(app PRIVATE
   src/main.cpp
+  src/app.cpp
   src/bh1749_light.cpp
 )
 

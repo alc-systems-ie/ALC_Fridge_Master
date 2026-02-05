@@ -12,9 +12,19 @@ constexpr char M_DEVICE_ID[] { "ffff0000111122223333444455551111" };
 // ========== Event Types ==========
 
 enum class FridgeEventType : uint8_t {
-  DoorOpen  = 1,
-  DoorClose = 2,
-  DoorAlert = 3,  // Door left open too long.
+  DoorOpen     = 1,
+  DoorClose    = 2,
+  DoorAlert    = 3,  // Door left open too long.
+  Calibration  = 4,  // Calibration data (diagnostic).
+};
+
+// ========== Calibration Status Codes ==========
+
+enum class CalibrationStatus : uint8_t {
+  Success              = 0,
+  ErrorLevelsTooClose  = 1,  // Closed level too close to open level.
+  ErrorSensorFailure   = 2,  // Sensor read failure.
+  ErrorTimeout         = 3,  // Door never closed within timeout.
 };
 
 // ========== Packet Structures ==========

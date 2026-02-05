@@ -249,6 +249,9 @@ namespace fridge
     s_disconnectExpected = true;
     s_nusEnabled = false;
 
+    // Stop advertising to prevent gateway from reconnecting.
+    bt_le_adv_stop();
+
     // Don't actively disconnect - the gateway disconnects after receiving
     // our packet, and we're about to enter System OFF anyway. Just clean
     // up our connection reference to avoid any pending operations.
@@ -256,6 +259,38 @@ namespace fridge
       bt_conn_unref(s_currentConnection);
       s_currentConnection = nullptr;
     }
+  }
+
+  void BleNus::PrepareReconnect()
+  {
+    LOG_INF("PrepareReconnect: current conn=%p, nusEnabled=%d.",
+            s_currentConnection, s_nusEnabled);
+
+    // Ensure advertising is stopped first.
+    int stopResult { bt_le_adv_stop() };
+    LOG_INF("bt_le_adv_stop returned %d.", stopResult);
+
+    // Reset state for a new connection cycle.
+    s_disconnectExpected = false;
+    s_nusEnabled = false;
+
+    // If still connected, need to properly disconnect first.
+    if (s_currentConnection) {
+      LOG_INF("Still have connection reference, disconnecting...");
+      bt_conn_disconnect(s_currentConnection, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+      bt_conn_unref(s_currentConnection);
+      s_currentConnection = nullptr;
+      // Wait for disconnect to complete.
+      k_msleep(500);
+    }
+
+    k_sem_reset(&s_SemConnection);
+    k_sem_reset(&s_SemNusEnabled);
+
+    // Additional delay to allow BLE stack to settle.
+    k_msleep(100);
+
+    LOG_INF("PrepareReconnect complete.");
   }
 
   int8_t BleNus::GetRssi()
