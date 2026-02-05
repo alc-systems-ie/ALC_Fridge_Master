@@ -680,6 +680,7 @@ namespace fridge
     // Connect to gateway and send OPEN event.
     bool sent { false };
     int8_t rssi { 0 };
+    int8_t txPower { 0 };
 
     // Start BLE.
     int bleResult { s_ble.StartInit(nullptr) };
@@ -696,14 +697,14 @@ namespace fridge
         if (s_ble.StartAdvertising() == 0) {
           if (s_ble.WaitForConnection(M_BLE_CONNECT_TIMEOUT_MS)) {
             // Set connection TX power after connection established.
-            int8_t actualConnPower { s_ble.SetTxPower(M_TX_POWER_DBM) };
-            LOG_INF("CONN TX power: %d dBm (antenna ~%d dBm with FEM).", actualConnPower, actualConnPower + 10);
+            txPower = s_ble.SetTxPower(M_TX_POWER_DBM);
+            LOG_INF("CONN TX power: %d dBm (antenna ~%d dBm with FEM).", txPower, txPower + 10);
 
             if (s_ble.WaitForNusEnabled(M_BLE_NUS_ENABLED_TIMEOUT_MS)) {
               rssi = s_ble.GetRssi();
-              sent = sendOpenEvent(rssi);
+              sent = sendOpenEvent(rssi, txPower);
               if (sent) {
-                LOG_INF("Sent OPEN packet (rssi=%d dBm).", rssi);
+                LOG_INF("Sent OPEN packet (rssi=%d dBm, txPower=%d dBm).", rssi, txPower);
               }
             }
           }
@@ -713,6 +714,11 @@ namespace fridge
 
     if (!sent) {
       LOG_WRN("Failed to send OPEN event - BLE not ready.");
+    } else {
+      // Brief green blink to indicate successful transmission.
+      ledSetGreen();
+      k_msleep(100);
+      ledOff();
     }
 
     // Disconnect BLE.
@@ -724,7 +730,7 @@ namespace fridge
     configureLightSensorForDoorClose();
   }
 
-  bool App::sendOpenEvent(int8_t rssi)
+  bool App::sendOpenEvent(int8_t rssi, int8_t txPower)
   {
     FridgeGatewayPacket packet {};
     memset(&packet, 0, sizeof(packet));
@@ -735,6 +741,7 @@ namespace fridge
     // Light data fields left as 0 - we don't read the sensor on wake anymore.
     packet.green = m_doorOpenLight;  // Include the quick read we did for diagnostics.
     packet.rssiDbm = rssi;
+    packet.txPowerDbm = txPower;
 
     int result { s_ble.SendEvent(reinterpret_cast<const uint8_t*>(&packet), sizeof(packet)) };
     return (result == 0);
@@ -1106,6 +1113,7 @@ namespace fridge
     packet.blue = m_calibration.wakeThreshold;
     packet.ir = 0;
     packet.rssiDbm = rssi;
+    packet.txPowerDbm = 0;  // Calibration uses default TX power.
 
     int result { s_ble.SendEvent(reinterpret_cast<const uint8_t*>(&packet), sizeof(packet)) };
     if (result == 0) {

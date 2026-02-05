@@ -45,7 +45,8 @@ struct __packed FridgeGatewayPacket {
   uint16_t blue;
   uint16_t ir;
   int8_t   rssiDbm;             // Link quality at transmission.
-};  // 60 bytes
+  int8_t   txPowerDbm;          // TX power at antenna.
+};  // 61 bytes
 
 /**
  * @brief Internal light reading structure.

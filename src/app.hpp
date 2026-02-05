@@ -130,7 +130,7 @@ namespace fridge
       // ========== Normal Operation ==========
 
       void sendDoorOpenAndSleep();
-      bool sendOpenEvent(int8_t rssi);
+      bool sendOpenEvent(int8_t rssi, int8_t txPower);
 
       // ========== Calibration Events ==========
 
