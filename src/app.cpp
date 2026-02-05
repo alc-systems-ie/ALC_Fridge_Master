@@ -983,39 +983,44 @@ namespace fridge
   {
     LOG_INF("Configuring wake sources for System OFF...");
 
-    // Debug: read current INT pin state and BH1749 interrupt register.
-    int intPinRaw = gpio_pin_get_raw(s_lightInt.port, s_lightInt.pin);
-    int intPinDt = gpio_pin_get_dt(&s_lightInt);
-    LOG_INF("Light INT pin before config: raw=%d, dt=%d", intPinRaw, intPinDt);
-
-    // Read a fresh light value to see current level.
-    LightReading reading {};
-    if (s_light.Read(reading) == 0) {
-      LOG_INF("Current light reading: green=%u (threshold=%u)", reading.green, m_calibration.wakeThreshold);
-    }
-
     // Only enable light wake if device is calibrated.
     if (isCalibrated()) {
-      LOG_INF("Device is calibrated, configuring light wake...");
+      // Dump BH1749 interrupt registers for diagnostics.
+      s_light.DumpInterruptRegisters();
+
+      // Read a fresh light value to see current level.
+      LightReading reading {};
+      if (s_light.Read(reading) == 0) {
+        LOG_INF("Current light: green=%u (wake threshold=%u)", reading.green, m_calibration.wakeThreshold);
+      }
+
+      // Clear any pending interrupt just before configuring GPIO.
+      s_light.ClearInterrupt();
+
+      // Read INT pin state after clearing.
+      int intPinRaw = gpio_pin_get_raw(s_lightInt.port, s_lightInt.pin);
+      LOG_INF("INT pin after clear: raw=%d (expect 1=HIGH=idle)", intPinRaw);
+
       // Configure light INT sense for wake on LOW (INT asserted = light detected).
       // BH1749 INT is active-low: goes LOW when threshold exceeded.
       int result = gpio_pin_interrupt_configure_dt(&s_lightInt, GPIO_INT_LEVEL_LOW);
-      LOG_INF("Light wake configured: result=%d, threshold=%u", result, m_calibration.wakeThreshold);
+      if (result < 0) {
+        LOG_ERR("Failed to configure light wake: %d!", result);
+      } else {
+        LOG_INF("Light wake enabled: sense LOW, threshold=%u", m_calibration.wakeThreshold);
+      }
     } else {
-      LOG_INF("Device is NOT calibrated, disabling light wake...");
-      // Disable light wake - only button can wake uncalibrated device.
-      int result = gpio_pin_interrupt_configure_dt(&s_lightInt, GPIO_INT_DISABLE);
-      LOG_INF("Light wake disabled: result=%d", result);
+      LOG_INF("Device NOT calibrated - light wake disabled.");
+      gpio_pin_interrupt_configure_dt(&s_lightInt, GPIO_INT_DISABLE);
     }
 
     // Configure button for wake (sense LOW since button is active-low).
-    LOG_INF("Configuring button wake...");
     int result = gpio_pin_interrupt_configure_dt(&s_button, GPIO_INT_LEVEL_LOW);
-    LOG_INF("Button wake configured: result=%d", result);
-
-    // Debug: read INT pin state after config.
-    intPinRaw = gpio_pin_get_raw(s_lightInt.port, s_lightInt.pin);
-    LOG_INF("Light INT pin after config: raw=%d", intPinRaw);
+    if (result < 0) {
+      LOG_ERR("Failed to configure button wake: %d!", result);
+    } else {
+      LOG_INF("Button wake enabled.");
+    }
   }
 
   void App::enterSystemOff()

@@ -77,7 +77,6 @@ namespace fridge
   constexpr uint8_t M_DOOR_CLOSE_THRESHOLD_PERCENT { 30 }; // % of open level to detect closed.
   constexpr uint8_t M_VALID_CALIBRATION_PERCENT { 50 };    // Max closed/open ratio for valid cal.
   constexpr uint8_t M_WAKE_THRESHOLD_OFFSET_PERCENT { 30 };// Wake threshold: closed + 30% of range.
-  constexpr uint32_t M_DOOR_SETTLE_TIME_MS { 10000 };      // Wait time after door close detected.
 
   // ========== Application Class ==========
 

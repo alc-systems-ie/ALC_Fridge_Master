@@ -168,7 +168,6 @@ struct __packed FridgeGatewayPacket {
 | `M_DOOR_CLOSE_THRESHOLD_PERCENT` | 30 | % of open level to detect closed |
 | `M_VALID_CALIBRATION_PERCENT` | 50 | Max closed/open ratio for valid calibration |
 | `M_WAKE_THRESHOLD_OFFSET_PERCENT` | 30 | Wake = closed + 30% of (open - closed) |
-| `M_DOOR_SETTLE_TIME_MS` | 10000 | Wait after door close before sampling |
 | `M_BUTTON_FACTORY_RESET_MS` | 10000 | Hold time for factory reset |
 
 ## Wake Threshold Calculation
