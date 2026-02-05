@@ -677,12 +677,12 @@ namespace fridge
     m_doorOpenLight = reading.green;
     LOG_INF("Door open light: green=%u.", m_doorOpenLight);
 
-    // If light is below threshold, this might be a spurious wake - go back to sleep
-    // with door-open detection (don't flip to door-close detection).
+    // If light is below threshold, this is a door-close wake (or spurious).
+    // Reconfigure for door-open detection and go back to sleep.
     if (m_doorOpenLight < m_calibration.wakeThreshold) {
-      LOG_WRN("Light below wake threshold (%u < %u), spurious wake.",
+      LOG_INF("Light below wake threshold (%u < %u) - door closed, reconfiguring.",
               m_doorOpenLight, m_calibration.wakeThreshold);
-      s_light.ClearInterrupt();
+      configureLightSensorForWake();
       return;
     }
 
