@@ -646,44 +646,38 @@ namespace fridge
 
   void App::sendDoorOpenAndSleep()
   {
-    LOG_INF("Door opened - sending OPEN event.");
+    // The BH1749 interrupt triggered, telling us the light level crossed a threshold.
+    // We don't need to re-read the sensor - just check which direction we were detecting.
+    //
+    // If we were detecting door-open (high threshold): light went HIGH -> send OPEN event.
+    // If we were detecting door-close (low threshold): light went LOW -> just reconfigure.
 
-    // Start BLE init FIRST - non-blocking, runs in background while we init sensor.
+    // Initialise sensor to reconfigure thresholds (resets it but we need I2C access).
+    if (!initLightSensor()) {
+      LOG_ERR("Sensor init failed!");
+      return;
+    }
+
+    // Quick read to determine if this is door-open or door-close.
+    // The sensor was just reset, so read what we can (may be stale but direction is clear).
+    LightReading reading {};
+    s_light.Read(reading);
+    m_doorOpenLight = reading.green;
+
+    // If light is low, this was a door-close wake. Reconfigure for door-open and sleep.
+    if (m_doorOpenLight < m_calibration.wakeThreshold) {
+      LOG_INF("Door closed (green=%u) - reconfiguring for door-open detection.", m_doorOpenLight);
+      configureLightSensorForWake();
+      return;
+    }
+
+    // Door is open - send OPEN event.
+    LOG_INF("Door opened (green=%u) - sending OPEN event.", m_doorOpenLight);
+
+    // Start BLE.
     int bleResult { s_ble.StartInit(nullptr) };
     if (bleResult < 0) {
       LOG_ERR("BLE start init failed: %d!", bleResult);
-    }
-
-    // Initialise sensor while BLE is starting up in background.
-    if (!initLightSensor()) {
-      LOG_ERR("Sensor init failed after wake!");
-      return;
-    }
-
-    // Wait for valid measurement.
-    if (!s_light.WaitForValid(M_VALID_MEAS_TIMEOUT_MS)) {
-      LOG_WRN("Timeout waiting for valid measurement on wake.");
-    }
-
-    // Wait for next measurement cycle to ensure fresh data.
-    k_msleep(150);
-
-    // Read light level to include in packet.
-    LightReading reading {};
-    if (s_light.Read(reading) < 0) {
-      LOG_WRN("Failed to read light on wake.");
-    }
-
-    m_doorOpenLight = reading.green;
-    LOG_INF("Door open light: green=%u.", m_doorOpenLight);
-
-    // If light is below threshold, this is a door-close wake (or spurious).
-    // Reconfigure for door-open detection and go back to sleep.
-    if (m_doorOpenLight < m_calibration.wakeThreshold) {
-      LOG_INF("Light below wake threshold (%u < %u) - door closed, reconfiguring.",
-              m_doorOpenLight, m_calibration.wakeThreshold);
-      configureLightSensorForWake();
-      return;
     }
 
     // Connect to gateway and send OPEN event.
@@ -699,7 +693,7 @@ namespace fridge
                 rssi = s_ble.GetRssi();
                 sent = sendOpenEvent(rssi);
                 if (sent) {
-                  LOG_INF("Sent OPEN packet (green=%u, rssi=%d dBm).", m_doorOpenLight, rssi);
+                  LOG_INF("Sent OPEN packet (rssi=%d dBm).", rssi);
                 }
               }
             }
@@ -716,12 +710,6 @@ namespace fridge
     s_ble.Disconnect();
     k_msleep(100);
 
-    // Update calibration with this door-open level for adaptive threshold.
-    m_calibration.doorOpenLight = m_doorOpenLight;
-    m_calibration.wakeThreshold = calculateWakeThreshold(m_doorOpenLight, m_calibration.doorClosedLight);
-    LOG_INF("Updated wake threshold: %u (open=%u, closed=%u).",
-            m_calibration.wakeThreshold, m_doorOpenLight, m_calibration.doorClosedLight);
-
     // Configure sensor to wake on door CLOSE (light drops below threshold).
     // This prevents immediate re-wake while door is still open.
     configureLightSensorForDoorClose();
@@ -729,19 +717,14 @@ namespace fridge
 
   bool App::sendOpenEvent(int8_t rssi)
   {
-    LightReading reading {};
-    s_light.Read(reading);
-
     FridgeGatewayPacket packet {};
     memset(&packet, 0, sizeof(packet));
     memcpy(packet.deviceId, M_DEVICE_ID, sizeof(packet.deviceId));
     strncpy(packet.deviceName, CONFIG_BT_DEVICE_NAME, sizeof(packet.deviceName) - 1);
     packet.eventType = static_cast<uint8_t>(FridgeEventType::DoorOpen);
     packet.durationSecs = 0;
-    packet.red = reading.red;
-    packet.green = reading.green;
-    packet.blue = reading.blue;
-    packet.ir = reading.ir;
+    // Light data fields left as 0 - we don't read the sensor on wake anymore.
+    packet.green = m_doorOpenLight;  // Include the quick read we did for diagnostics.
     packet.rssiDbm = rssi;
 
     int result { s_ble.SendEvent(reinterpret_cast<const uint8_t*>(&packet), sizeof(packet)) };
