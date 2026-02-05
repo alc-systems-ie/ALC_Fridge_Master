@@ -229,13 +229,37 @@ Custom direct I2C driver in `bh1749_light.cpp` — bypasses Zephyr sensor API to
 
 ## FEM Configuration
 
-The Thingy:53 has an nRF21540 FEM on the net core. Configuration is in `sysbuild/hci_ipc.conf`:
+The Thingy:53 has an nRF21540 FEM on the net core. The MODE pin (P1.12) selects between two gain modes:
+
+| MODE Pin | Gain Mode | TX Gain |
+|----------|-----------|---------|
+| LOW (0)  | POUTA     | +20 dB  |
+| HIGH (1) | POUTB     | +10 dB  |
+
+Configuration is in `sysbuild/hci_ipc.conf`:
 
 ```
 CONFIG_MPSL_FEM=y
 CONFIG_MPSL_FEM_NRF21540_GPIO=y
-CONFIG_MPSL_FEM_NRF21540_TX_GAIN_DB=20
+CONFIG_MPSL_FEM_NRF21540_TX_GAIN_DB_POUTA=20
+CONFIG_MPSL_FEM_NRF21540_TX_GAIN_DB_POUTB=10
+CONFIG_MPSL_FEM_NRF21540_RUNTIME_PA_GAIN_CONTROL=y
+CONFIG_BT_CTLR_TX_PWR_DYNAMIC_CONTROL=y
 ```
+
+### Runtime TX Power Control
+
+With `RUNTIME_PA_GAIN_CONTROL` enabled, you don't directly control the MODE pin. Instead, you request a TX power level via the HCI vendor command, and the MPSL driver automatically selects the most efficient FEM gain mode:
+
+```cpp
+// Request TX power - driver selects POUTA or POUTB automatically
+s_ble.SetTxPower(0);    // 0 dBm SoC → driver picks FEM gain for best efficiency
+s_ble.SetAdvTxPower(0); // Same for advertising (call before StartAdvertising)
+```
+
+The driver will use POUTB (+10 dB) when possible (lower current draw) and switch to POUTA (+20 dB) when higher power is requested.
+
+**Effective antenna power** = SoC TX power + FEM gain (10 or 20 dB depending on mode selected)
 
 ## Differences from ALC_Drawer_Master
 
@@ -247,7 +271,7 @@ CONFIG_MPSL_FEM_NRF21540_TX_GAIN_DB=20
 | Event timing | Send on wake (activity) | Send OPEN on wake, CLOSE on door close |
 | Duration tracking | None (instant event) | Track open-to-close time |
 | Alert | None | Door open > timeout |
-| TX power control | RSSI-based adaptive | Fixed full power (reliability in metal box) |
+| TX power control | RSSI-based adaptive | Runtime FEM gain control via SetTxPower() |
 
 ## Lessons Learned
 

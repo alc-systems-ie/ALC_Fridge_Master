@@ -671,7 +671,10 @@ namespace fridge
     LOG_INF("Door opened - sending OPEN event.");
 
     // TX power settings.
-    // Default SoC power is 0 dBm, with POUTB FEM (+10dB) = +10 dBm at antenna.
+    // With runtime PA gain control, the FEM automatically selects:
+    //   - POUTB (+10 dB) for lower power requests
+    //   - POUTA (+20 dB) for higher power requests
+    // Request 0 dBm SoC power. The driver will select appropriate FEM gain.
     constexpr int8_t M_TX_POWER_DBM { 0 };
 
     // Connect to gateway and send OPEN event.
