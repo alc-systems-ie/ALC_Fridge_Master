@@ -8,9 +8,8 @@ Ultra-low-power fridge door monitor using System OFF sleep with BH1749 light sen
 - Button-initiated commissioning with two-phase light calibration
 - System OFF sleep until light detected (door opened)
 - Non-blocking BLE init on wake (parallelised with sensor init)
-- BLE connection established while door is open
-- Sends OPEN packet when door opens, CLOSE packet when door closes (with duration)
-- Warning ALERT if door open > timeout (configurable)
+- Sends OPEN packet when door opens, then immediately sleeps
+- Uses BH1749 window comparator to avoid wake loops (flips between high/low threshold detection)
 - Adaptive wake threshold based on calibrated open/closed light levels
 - Factory reset via 10-second button hold
 - FEM support at +20 dBm for extended range
@@ -75,7 +74,6 @@ Button press (uncalibrated device)
     │   │
     │   ├── [3 consecutive readings < 30% of open level]
     │   │   → Door closed detected
-    │   │   ├── Wait 10s for light to settle
     │   │   ├── Sample door-closed light (5 readings)
     │   │   ├── Validate: closed < 50% of open
     │   │   │   ├── [Valid]
@@ -98,27 +96,35 @@ Button press (uncalibrated device)
 ## Normal Operation Flow
 
 ```
-Light interrupt wake (calibrated device)
+Light interrupt wake (calibrated device, door opened)
     │
-    ├── Init BLE (non-blocking)
-    ├── Init light sensor
+    ├── Init BLE (non-blocking) + Init light sensor (parallel)
     ├── Sample door-open light
     │
-    ├── [Light < minimum threshold] → Spurious wake, System OFF
+    ├── [Light < wake threshold] → Spurious wake, System OFF (door-open detection)
     │
     ├── Connect to gateway, send OPEN event
-    │
-    ├── Monitor for door close (poll every 500ms)
-    │   │
-    │   ├── [Light drops below threshold]
-    │   │   ├── Send CLOSE event (with duration)
-    │   │   ├── Update wake threshold from new open level
-    │   │   └── System OFF
-    │   │
-    │   └── [Door open > timeout]
-    │       ├── Send ALERT event
-    │       └── Continue monitoring
+    ├── Update adaptive wake threshold from new open level
+    ├── Configure BH1749 for door-close detection (low threshold)
+    └── System OFF
+        │
+        └── [Light drops below close threshold]
+            → Wake, configure for door-open detection, System OFF
 ```
+
+### BH1749 Interrupt Configuration
+
+The BH1749 uses a window comparator. To avoid wake loops when the door is left open:
+
+**Door-open detection (normal sleep):**
+- High threshold = wake threshold (triggers when light goes above)
+- Low threshold = 0 (disabled)
+
+**Door-close detection (after sending OPEN):**
+- High threshold = 0xFFFF (disabled)
+- Low threshold = wake_threshold / 2 (triggers when light drops)
+
+This ensures the device doesn't immediately re-wake while the door is still open.
 
 ## Gateway Packet Format
 
@@ -141,8 +147,8 @@ struct __packed FridgeGatewayPacket {
 | Type | Value | Description |
 |------|-------|-------------|
 | DoorOpen | 1 | Door opened |
-| DoorClose | 2 | Door closed (durationSecs = time open) |
-| DoorAlert | 3 | Door open too long |
+| DoorClose | 2 | (Reserved, not currently used) |
+| DoorAlert | 3 | (Reserved, not currently used) |
 | Calibration | 4 | Calibration result (durationSecs = status code) |
 
 ### Calibration Status Codes
@@ -158,10 +164,8 @@ struct __packed FridgeGatewayPacket {
 
 | Constant | Value | Description |
 |----------|-------|-------------|
-| `M_LIGHT_THRESHOLD_LOW` | 50 | Door close detection (green channel) |
 | `M_WAKE_THRESHOLD_MIN` | 15 | Minimum wake threshold |
 | `M_WAKE_THRESHOLD_MAX` | 200 | Maximum wake threshold |
-| `M_DOOR_OPEN_TIMEOUT_SECS` | 60 | Alert threshold (testing) |
 | `M_CALIBRATION_TIMEOUT_MS` | 300000 | 5 minutes for door close during calibration |
 | `M_SAMPLES_PER_READING` | 5 | Samples averaged per light reading |
 | `M_DOOR_CLOSE_CONSECUTIVE` | 3 | Consecutive low readings to confirm door closed |

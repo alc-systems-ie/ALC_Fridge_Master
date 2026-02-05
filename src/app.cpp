@@ -45,9 +45,6 @@ namespace fridge
 
   // ========== Configuration Constants ==========
 
-  // Light threshold for door closed detection (absolute minimum).
-  constexpr uint16_t M_LIGHT_THRESHOLD_LOW { 50 };
-
   // Minimum wake threshold to avoid spurious wakes in very dark environments.
   constexpr uint16_t M_WAKE_THRESHOLD_MIN { 15 };
 
@@ -124,7 +121,6 @@ namespace fridge
     : m_state { AppState::PowerOff }
     , m_wakeSource { WakeSource::PowerOn }
     , m_calibration {}
-    , m_wakeTime { 0 }
     , m_doorOpenLight { 0 }
   {
   }
@@ -414,13 +410,10 @@ namespace fridge
       return;
     }
 
-    // Record wake time for duration tracking.
-    m_wakeTime = k_uptime_get_32();
-
     setState(AppState::Monitoring);
 
-    // Monitor door open/close and transmit events.
-    monitorDoor();
+    // Send door open event and go back to sleep.
+    sendDoorOpenAndSleep();
 
     setState(AppState::Ready);
   }
@@ -651,12 +644,11 @@ namespace fridge
 
   // ========== Normal Operation ==========
 
-  void App::monitorDoor()
+  void App::sendDoorOpenAndSleep()
   {
-    LOG_INF("Door opened - starting monitoring.");
+    LOG_INF("Door opened - sending OPEN event.");
 
     // Start BLE init FIRST - non-blocking, runs in background while we init sensor.
-    LOG_INF("Starting BLE init (non-blocking)...");
     int bleResult { s_ble.StartInit(nullptr) };
     if (bleResult < 0) {
       LOG_ERR("BLE start init failed: %d!", bleResult);
@@ -676,40 +668,39 @@ namespace fridge
     // Wait for next measurement cycle to ensure fresh data.
     k_msleep(150);
 
-    // Read initial light level - this is the door-open level.
+    // Read light level to include in packet.
     LightReading reading {};
     if (s_light.Read(reading) < 0) {
       LOG_WRN("Failed to read light on wake.");
     }
 
     m_doorOpenLight = reading.green;
-    LOG_INF("Wake light (door open): green=%u.", m_doorOpenLight);
+    LOG_INF("Door open light: green=%u.", m_doorOpenLight);
 
-    // If light is below minimum threshold, this might be a spurious wake.
-    if (m_doorOpenLight < M_WAKE_THRESHOLD_MIN) {
-      LOG_WRN("Light below minimum threshold on wake, spurious? Going back to sleep.");
+    // If light is below threshold, this might be a spurious wake - go back to sleep
+    // with door-open detection (don't flip to door-close detection).
+    if (m_doorOpenLight < m_calibration.wakeThreshold) {
+      LOG_WRN("Light below wake threshold (%u < %u), spurious wake.",
+              m_doorOpenLight, m_calibration.wakeThreshold);
       s_light.ClearInterrupt();
       return;
     }
 
-    // Wait for BLE to be ready.
-    bool bleReady { false };
-    bool bleConnected { false };
-    bool nusEnabled { false };
-    bool openSent { false };
-    bool alertSent { false };
+    // Connect to gateway and send OPEN event.
+    bool sent { false };
     int8_t rssi { 0 };
 
     if (bleResult == 0) {
       if (s_ble.WaitForReady(M_BLE_READY_TIMEOUT_MS)) {
         if (s_ble.CompleteInit() == 0) {
-          bleReady = true;
           if (s_ble.StartAdvertising() == 0) {
             if (s_ble.WaitForConnection(M_BLE_CONNECT_TIMEOUT_MS)) {
-              bleConnected = true;
               if (s_ble.WaitForNusEnabled(M_BLE_NUS_ENABLED_TIMEOUT_MS)) {
-                nusEnabled = true;
                 rssi = s_ble.GetRssi();
+                sent = sendOpenEvent(rssi);
+                if (sent) {
+                  LOG_INF("Sent OPEN packet (green=%u, rssi=%d dBm).", m_doorOpenLight, rssi);
+                }
               }
             }
           }
@@ -717,101 +708,23 @@ namespace fridge
       }
     }
 
-    // Send OPEN event if BLE is ready.
-    if (nusEnabled) {
-      openSent = sendOpenEvent(rssi);
-      if (openSent) {
-        LOG_INF("Sent OPEN packet (green=%u, rssi=%d dBm).", m_doorOpenLight, rssi);
-      }
-    } else {
-      LOG_WRN("BLE not ready - cannot send OPEN event.");
+    if (!sent) {
+      LOG_WRN("Failed to send OPEN event - BLE not ready.");
     }
 
-    // Monitor for door close.
-    while (true) {
-      k_msleep(M_POLL_INTERVAL_MS);
+    // Disconnect BLE.
+    s_ble.Disconnect();
+    k_msleep(100);
 
-      // Read light sensor.
-      if (s_light.Read(reading) < 0) {
-        continue;
-      }
+    // Update calibration with this door-open level for adaptive threshold.
+    m_calibration.doorOpenLight = m_doorOpenLight;
+    m_calibration.wakeThreshold = calculateWakeThreshold(m_doorOpenLight, m_calibration.doorClosedLight);
+    LOG_INF("Updated wake threshold: %u (open=%u, closed=%u).",
+            m_calibration.wakeThreshold, m_doorOpenLight, m_calibration.doorClosedLight);
 
-      // Check for door close.
-      if (reading.green < M_LIGHT_THRESHOLD_LOW) {
-        uint32_t elapsedMs { k_uptime_get_32() - m_wakeTime };
-        uint16_t elapsedSecs { static_cast<uint16_t>(elapsedMs / 1000) };
-        LOG_INF("Door closed (green=%u, was open %u s).", reading.green, elapsedSecs);
-
-        // Reconnect to send CLOSE event if we disconnected.
-        if (!s_ble.IsConnected()) {
-          s_ble.PrepareReconnect();
-          if (s_ble.StartAdvertising() == 0) {
-            if (s_ble.WaitForConnection(M_BLE_CONNECT_TIMEOUT_MS)) {
-              if (s_ble.WaitForNusEnabled(M_BLE_NUS_ENABLED_TIMEOUT_MS)) {
-                rssi = s_ble.GetRssi();
-                sendCloseEvent(elapsedSecs, rssi);
-              }
-            }
-          }
-        } else {
-          rssi = s_ble.GetRssi();
-          sendCloseEvent(elapsedSecs, rssi);
-        }
-
-        // Disconnect and clean up.
-        s_ble.Disconnect();
-        k_msleep(100);
-
-        // Update wake threshold from this door-open cycle.
-        // Use the new door-open level with the calibrated closed level.
-        m_calibration.doorOpenLight = m_doorOpenLight;
-        m_calibration.wakeThreshold = calculateWakeThreshold(m_doorOpenLight, m_calibration.doorClosedLight);
-        LOG_INF("Updated wake threshold: %u (open=%u, closed=%u).",
-                m_calibration.wakeThreshold, m_doorOpenLight, m_calibration.doorClosedLight);
-
-        // Configure thresholds for next wake.
-        configureLightSensorForWake();
-
-        // Clear interrupt and return.
-        s_light.ClearInterrupt();
-        return;
-      }
-
-      // Check for timeout alert.
-      uint32_t elapsedMs { k_uptime_get_32() - m_wakeTime };
-      uint16_t elapsedSecs { static_cast<uint16_t>(elapsedMs / 1000) };
-
-      if (!alertSent && (elapsedSecs >= M_DOOR_OPEN_TIMEOUT_SECS)) {
-        LOG_WRN("*** DOOR OPEN TIMEOUT (%u s) - sending alert ***", elapsedSecs);
-
-        // Reconnect if needed.
-        if (!s_ble.IsConnected()) {
-          s_ble.PrepareReconnect();
-          if (s_ble.StartAdvertising() == 0) {
-            if (s_ble.WaitForConnection(M_BLE_CONNECT_TIMEOUT_MS)) {
-              if (s_ble.WaitForNusEnabled(M_BLE_NUS_ENABLED_TIMEOUT_MS)) {
-                rssi = s_ble.GetRssi();
-                sendAlertEvent(elapsedSecs, rssi);
-                alertSent = true;
-              }
-            }
-          }
-          s_ble.Disconnect();
-          k_msleep(100);
-        } else {
-          rssi = s_ble.GetRssi();
-          sendAlertEvent(elapsedSecs, rssi);
-          alertSent = true;
-        }
-      }
-
-      // Log periodically.
-      static uint32_t lastLog { 0 };
-      if (k_uptime_get_32() - lastLog > 5000) {
-        LOG_INF("Door still open: green=%u, elapsed=%u s.", reading.green, elapsedSecs);
-        lastLog = k_uptime_get_32();
-      }
-    }
+    // Configure sensor to wake on door CLOSE (light drops below threshold).
+    // This prevents immediate re-wake while door is still open.
+    configureLightSensorForDoorClose();
   }
 
   bool App::sendOpenEvent(int8_t rssi)
@@ -832,54 +745,6 @@ namespace fridge
     packet.rssiDbm = rssi;
 
     int result { s_ble.SendEvent(reinterpret_cast<const uint8_t*>(&packet), sizeof(packet)) };
-    return (result == 0);
-  }
-
-  bool App::sendCloseEvent(uint16_t durationSecs, int8_t rssi)
-  {
-    LightReading reading {};
-    s_light.Read(reading);
-
-    FridgeGatewayPacket packet {};
-    memset(&packet, 0, sizeof(packet));
-    memcpy(packet.deviceId, M_DEVICE_ID, sizeof(packet.deviceId));
-    strncpy(packet.deviceName, CONFIG_BT_DEVICE_NAME, sizeof(packet.deviceName) - 1);
-    packet.eventType = static_cast<uint8_t>(FridgeEventType::DoorClose);
-    packet.durationSecs = durationSecs;
-    packet.red = reading.red;
-    packet.green = reading.green;
-    packet.blue = reading.blue;
-    packet.ir = reading.ir;
-    packet.rssiDbm = rssi;
-
-    int result { s_ble.SendEvent(reinterpret_cast<const uint8_t*>(&packet), sizeof(packet)) };
-    if (result == 0) {
-      LOG_INF("Sent CLOSE packet (duration=%u s, rssi=%d dBm).", durationSecs, rssi);
-    }
-    return (result == 0);
-  }
-
-  bool App::sendAlertEvent(uint16_t durationSecs, int8_t rssi)
-  {
-    LightReading reading {};
-    s_light.Read(reading);
-
-    FridgeGatewayPacket packet {};
-    memset(&packet, 0, sizeof(packet));
-    memcpy(packet.deviceId, M_DEVICE_ID, sizeof(packet.deviceId));
-    strncpy(packet.deviceName, CONFIG_BT_DEVICE_NAME, sizeof(packet.deviceName) - 1);
-    packet.eventType = static_cast<uint8_t>(FridgeEventType::DoorAlert);
-    packet.durationSecs = durationSecs;
-    packet.red = reading.red;
-    packet.green = reading.green;
-    packet.blue = reading.blue;
-    packet.ir = reading.ir;
-    packet.rssiDbm = rssi;
-
-    int result { s_ble.SendEvent(reinterpret_cast<const uint8_t*>(&packet), sizeof(packet)) };
-    if (result == 0) {
-      LOG_INF("Sent ALERT packet (duration=%u s, rssi=%d dBm).", durationSecs, rssi);
-    }
     return (result == 0);
   }
 
@@ -920,7 +785,39 @@ namespace fridge
     // Clear any pending interrupt.
     s_light.ClearInterrupt();
 
-    LOG_INF("Wake interrupt configured: trigger on green > %u.", m_calibration.wakeThreshold);
+    LOG_INF("Wake configured: trigger on green > %u (door open detection).", m_calibration.wakeThreshold);
+  }
+
+  void App::configureLightSensorForDoorClose()
+  {
+    // After door open event, configure to wake on light DECREASE (door close).
+    // Set high threshold to 0xFFFF (disabled) so only low threshold can trigger.
+    // Use the calibrated closed level as the low threshold.
+    constexpr uint16_t M_HIGH_THRESHOLD_DISABLED { 0xFFFF };
+
+    // Use a threshold slightly above the calibrated closed level to ensure reliable detection.
+    // The door-close threshold should be below the wake threshold but above the closed level.
+    uint16_t closeThreshold { static_cast<uint16_t>(m_calibration.wakeThreshold / 2) };
+    if (closeThreshold < M_WAKE_THRESHOLD_MIN) {
+      closeThreshold = M_WAKE_THRESHOLD_MIN;
+    }
+
+    int result { s_light.ConfigureInterrupt(M_HIGH_THRESHOLD_DISABLED, closeThreshold) };
+    if (result < 0) {
+      LOG_ERR("Failed to configure door-close thresholds: %d!", result);
+      return;
+    }
+
+    result = s_light.EnableInterrupt(true);
+    if (result < 0) {
+      LOG_ERR("Failed to enable interrupt: %d!", result);
+      return;
+    }
+
+    // Clear any pending interrupt.
+    s_light.ClearInterrupt();
+
+    LOG_INF("Wake configured: trigger on green < %u (door close detection).", closeThreshold);
   }
 
   // ========== LED Feedback ==========

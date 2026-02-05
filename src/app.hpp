@@ -67,8 +67,7 @@ namespace fridge
   constexpr uint32_t M_BUTTON_FACTORY_RESET_MS { 10000 };  // Factory reset threshold.
   constexpr uint32_t M_ACTIVATION_TIMEOUT_MS { 30000 };    // Gateway search timeout.
   constexpr uint32_t M_CALIBRATION_TIMEOUT_MS { 300000 };  // 5 minutes for door close.
-  constexpr uint32_t M_DOOR_OPEN_TIMEOUT_SECS { 60 };      // Alert threshold (testing).
-  constexpr uint32_t M_POLL_INTERVAL_MS { 500 };           // Door monitoring poll interval.
+  constexpr uint32_t M_POLL_INTERVAL_MS { 500 };           // Calibration poll interval.
 
   // ========== Calibration Constants ==========
 
@@ -130,10 +129,8 @@ namespace fridge
 
       // ========== Normal Operation ==========
 
-      void monitorDoor();
+      void sendDoorOpenAndSleep();
       bool sendOpenEvent(int8_t rssi);
-      bool sendCloseEvent(uint16_t durationSecs, int8_t rssi);
-      bool sendAlertEvent(uint16_t durationSecs, int8_t rssi);
 
       // ========== Calibration Events ==========
 
@@ -143,6 +140,7 @@ namespace fridge
 
       bool initLightSensor();
       void configureLightSensorForWake();
+      void configureLightSensorForDoorClose();
 
       // ========== Wake Source Detection ==========
 
@@ -184,7 +182,6 @@ namespace fridge
       AppState m_state;
       WakeSource m_wakeSource;
       CalibrationData m_calibration;
-      uint32_t m_wakeTime;           // Timestamp when door opened.
       uint16_t m_doorOpenLight;      // Light level when door opened (this wake cycle).
   };
 
